@@ -515,11 +515,23 @@ static void dw_i3c_master_end_xfer_locked(struct dw_i3c_master *master, u32 isr)
 	dw_i3c_master_start_xfer_locked(master);
 }
 
-static int dw_i3c_clk_cfg(struct dw_i3c_master *master)
+static const struct {
+	unsigned int freq;
+	unsigned int shift;
+} sdrs[] = {
+	{ I3C_BUS_SDR1_SCL_RATE, 0 },
+	{ I3C_BUS_SDR2_SCL_RATE, 8 },
+	{ I3C_BUS_SDR3_SCL_RATE, 16 },
+	{ I3C_BUS_SDR4_SCL_RATE, 24 },
+};
+
+static int dw_i3c_clk_cfg(struct dw_i3c_master *master, unsigned long i3c_rate,
+			  bool pure)
 {
 	unsigned long core_rate, core_period;
+	u8 tmp, hcnt, lcnt, lcnt_od;
 	u32 scl_timing;
-	u8 hcnt, lcnt;
+	unsigned int i;
 
 	core_rate = clk_get_rate(master->core_clk);
 	if (!core_rate)
@@ -527,32 +539,55 @@ static int dw_i3c_clk_cfg(struct dw_i3c_master *master)
 
 	core_period = DIV_ROUND_UP(1000000000, core_rate);
 
-	hcnt = DIV_ROUND_UP(I3C_BUS_THIGH_MAX_NS, core_period) - 1;
+	/*
+	 * In pure mode, use a 50% duty cycle at the configured frequency.
+	 *
+	 * In shared mode, we limit t_high, so that i3c SCL signalling is
+	 * rejected by the i2c devices' spike filter
+	 */
+	if (pure)
+		hcnt = DIV_ROUND_UP(core_rate, i3c_rate * 2);
+	else
+		hcnt = DIV_ROUND_UP(I3C_BUS_THIGH_MAX_NS, core_period) - 1;
+
+	/* Ensure our count values are acceptable to hardware */
 	if (hcnt < SCL_I3C_TIMING_CNT_MIN)
 		hcnt = SCL_I3C_TIMING_CNT_MIN;
 
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_TYP_I3C_SCL_RATE) - hcnt;
+	lcnt = DIV_ROUND_UP(core_rate, i3c_rate) - hcnt;
 	if (lcnt < SCL_I3C_TIMING_CNT_MIN)
 		lcnt = SCL_I3C_TIMING_CNT_MIN;
 
 	scl_timing = SCL_I3C_TIMING_HCNT(hcnt) | SCL_I3C_TIMING_LCNT(lcnt);
 	writel(scl_timing, master->regs + SCL_I3C_PP_TIMING);
 
-	if (!(readl(master->regs + DEVICE_CTRL) & DEV_CTRL_I2C_SLAVE_PRESENT))
+	if (pure)
 		writel(BUS_I3C_MST_FREE(lcnt), master->regs + BUS_FREE_TIMING);
 
-	lcnt = DIV_ROUND_UP(I3C_BUS_TLOW_OD_MIN_NS, core_period);
-	scl_timing = SCL_I3C_TIMING_HCNT(hcnt) | SCL_I3C_TIMING_LCNT(lcnt);
+	/*
+	 * Open drain mode requires a (larger) minimum of OD_MIN_NS, in
+	 * order to allow for the longer signal rise time
+	 */
+	lcnt_od = lcnt;
+	tmp = DIV_ROUND_UP(I3C_BUS_TLOW_OD_MIN_NS, core_period);
+	if (lcnt_od < tmp)
+		lcnt_od = tmp;
+
+	scl_timing = SCL_I3C_TIMING_HCNT(hcnt) | SCL_I3C_TIMING_LCNT(lcnt_od);
 	writel(scl_timing, master->regs + SCL_I3C_OD_TIMING);
 
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_SDR1_SCL_RATE) - hcnt;
-	scl_timing = SCL_EXT_LCNT_1(lcnt);
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_SDR2_SCL_RATE) - hcnt;
-	scl_timing |= SCL_EXT_LCNT_2(lcnt);
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_SDR3_SCL_RATE) - hcnt;
-	scl_timing |= SCL_EXT_LCNT_3(lcnt);
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_SDR4_SCL_RATE) - hcnt;
-	scl_timing |= SCL_EXT_LCNT_4(lcnt);
+	/*
+	 * Timings for lower SDRx rates where specified by device MXDS values;
+	 * we limit these to the global max rate provided, which also prevents
+	 * weird duty cycles
+	 */
+	scl_timing = 0;
+	for (i = 0; i < ARRAY_SIZE(sdrs); i++) {
+		tmp = DIV_ROUND_UP(core_rate, sdrs[i].freq) & 0xff;
+		if (tmp < lcnt)
+			tmp = lcnt;
+		scl_timing |= tmp << sdrs[i].shift;
+	}
 	writel(scl_timing, master->regs + SCL_EXT_LCNT_TIMING);
 
 	return 0;
@@ -605,7 +640,8 @@ static int dw_i3c_master_bus_init(struct i3c_master_controller *m)
 			return ret;
 		fallthrough;
 	case I3C_BUS_MODE_PURE:
-		ret = dw_i3c_clk_cfg(master);
+		ret = dw_i3c_clk_cfg(master, bus->scl_rate.i3c,
+				     bus->mode == I3C_BUS_MODE_PURE);
 		if (ret)
 			return ret;
 		break;
